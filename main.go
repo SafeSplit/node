@@ -84,6 +84,10 @@ var (
 	chain     []Block
 	proposeMu sync.Mutex // serializes block production on this node
 
+	acceptMu   sync.Mutex          // serializes block acceptance
+	orphanMu   sync.Mutex
+	orphanPool = map[string]Block{} // keyed by the previous_block_hash they need
+
 	client       *ethclient.Client
 	contract     *bind.BoundContract
 	auth         *bind.TransactOpts
@@ -120,10 +124,12 @@ func main() {
 	mux.HandleFunc("/gossip", handleGossip)
 	mux.HandleFunc("/blocks/propose", handlePropose)
 	mux.HandleFunc("/blocks/commit", handleCommit)
+	mux.HandleFunc("/blocks", handleBlocks)
 
-	// Discover peers + start heartbeat in the background.
+	// Discover peers, heartbeat, and periodically resync the chain.
 	go discover(bootstrap)
 	go heartbeatLoop()
+	go resyncLoop()
 
 	log.Printf("[%s] listening on %s (self=%s) contract=%s", nodeID, listen, self, contractAddr.Hex())
 	log.Fatal(http.ListenAndServe(listen, mux))
@@ -512,6 +518,148 @@ func commitBlock(addr string, b Block) {
 	}
 }
 
+/* ---------- resilience: orphan pool + resync ---------- */
+
+func blockInChain(hash string) bool {
+	chainMu.RLock()
+	defer chainMu.RUnlock()
+	for _, b := range chain {
+		if b.BlockHash == hash {
+			return true
+		}
+	}
+	return false
+}
+
+func blocksFrom(h int) []Block {
+	chainMu.RLock()
+	defer chainMu.RUnlock()
+	if h < 0 {
+		h = 0
+	}
+	if h >= len(chain) {
+		return []Block{}
+	}
+	out := make([]Block, len(chain)-h)
+	copy(out, chain[h:])
+	return out
+}
+
+// tryAcceptBlock links a block to the chain, holding out-of-order blocks in the
+// orphan pool until their predecessor arrives. Returns a short outcome string.
+func tryAcceptBlock(b Block) string {
+	acceptMu.Lock()
+	defer acceptMu.Unlock()
+
+	if blockInChain(b.BlockHash) {
+		return "duplicate"
+	}
+	if !validBlockHash(b) {
+		return "invalid"
+	}
+	if b.Signature != "" && b.PublicKey != "" {
+		if signer, err := recoverDigestSigner(b.EventHash, b.Signature); err != nil || !strings.EqualFold(signer, b.PublicKey) {
+			return "invalid"
+		}
+	}
+
+	if b.PrevHash == tip() {
+		appendBlock(b)
+		drainOrphansLocked()
+		return "appended"
+	}
+
+	// Can't link yet: a predecessor is missing. Hold it and trigger a resync.
+	if b.Height >= chainHeight() {
+		orphanMu.Lock()
+		orphanPool[b.PrevHash] = b
+		orphanMu.Unlock()
+		go resyncOnce()
+		return "orphan"
+	}
+	return "stale"
+}
+
+// drainOrphansLocked appends any held blocks that now chain onto the tip.
+// Caller must hold acceptMu.
+func drainOrphansLocked() {
+	for {
+		t := tip()
+		orphanMu.Lock()
+		b, ok := orphanPool[t]
+		if ok {
+			delete(orphanPool, t)
+		}
+		orphanMu.Unlock()
+		if !ok {
+			return
+		}
+		appendBlock(b)
+	}
+}
+
+func peerHeight(addr string) int {
+	resp, err := httpClient.Get(addr + "/status")
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+	var s struct {
+		ChainHeight int `json:"chain_height"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&s) != nil {
+		return -1
+	}
+	return s.ChainHeight
+}
+
+func fetchBlocks(addr string, from int) []Block {
+	resp, err := httpClient.Get(fmt.Sprintf("%s/blocks?from=%d", addr, from))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Blocks []Block `json:"blocks"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return nil
+	}
+	return out.Blocks
+}
+
+// resyncOnce finds the peer with the longest chain and downloads what we're missing.
+func resyncOnce() {
+	best, bestH := "", chainHeight()
+	for _, addr := range peerAddrs() {
+		if h := peerHeight(addr); h > bestH {
+			best, bestH = addr, h
+		}
+	}
+	if best == "" {
+		return
+	}
+	applied := 0
+	for _, b := range fetchBlocks(best, chainHeight()) {
+		if tryAcceptBlock(b) == "appended" {
+			applied++
+		}
+	}
+	if applied > 0 {
+		log.Printf("[%s] resynced %d block(s) from %s → height %d", nodeID, applied, best, chainHeight())
+	}
+}
+
+func resyncLoop() {
+	time.Sleep(5 * time.Second) // let discovery settle
+	resyncOnce()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		resyncOnce()
+	}
+}
+
 /* ---------- HTTP handlers ---------- */
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -639,13 +787,23 @@ func handleCommit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if err := validateBlock(b); err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+	outcome := tryAcceptBlock(b)
+	if outcome == "invalid" {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid block"})
 		return
 	}
-	appendBlock(b)
-	log.Printf("[%s] committed block %d (%s)", nodeID, b.Height, b.EventID)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "height": chainHeight()})
+	log.Printf("[%s] commit block %d (%s): %s", nodeID, b.Height, b.EventID, outcome)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "outcome": outcome, "height": chainHeight()})
+}
+
+func handleBlocks(w http.ResponseWriter, r *http.Request) {
+	from := 0
+	if v := r.URL.Query().Get("from"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			from = n
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"height": chainHeight(), "blocks": blocksFrom(from)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
