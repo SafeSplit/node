@@ -9,11 +9,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +37,9 @@ type deployment struct {
 type anchorRequest struct {
 	EventID   string `json:"event_id"`
 	EventHash string `json:"event_hash"`
-	Signature string `json:"signature"` // accepted now; verified in BLOC 2.2
+	Canonical string `json:"canonical"`  // canonical event string (to recompute the hash)
+	Signature string `json:"signature"`  // 0x + 130 hex
+	PublicKey string `json:"public_key"` // expected signer address
 }
 
 type anchorResponse struct {
@@ -132,6 +138,27 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// BLOC 2.2 — verify the event before anchoring (reject if invalid).
+	// (a) hash integrity: sha256(canonical) must equal the claimed event_hash.
+	if req.Canonical != "" {
+		sum := sha256.Sum256([]byte(req.Canonical))
+		if !strings.EqualFold(hex.EncodeToString(sum[:]), strings.TrimPrefix(req.EventHash, "0x")) {
+			log.Printf("rejected %s: hash mismatch", req.EventID)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "hash mismatch: sha256(canonical) != event_hash"})
+			return
+		}
+	}
+	// (b) signature: must recover the claimed signer over the digest (EIP-191).
+	if req.Signature != "" && req.PublicKey != "" {
+		signer, err := recoverDigestSigner(req.EventHash, req.Signature)
+		if err != nil || !strings.EqualFold(signer, req.PublicKey) {
+			log.Printf("rejected %s: invalid signature (got %s, want %s)", req.EventID, signer, req.PublicKey)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid signature"})
+			return
+		}
+		log.Printf("verified signature of %s by %s", req.EventID, signer)
+	}
+
 	// On-chain eventId = keccak256(uuid) — must match the PHP AnchorService.
 	var eventID [32]byte
 	copy(eventID[:], crypto.Keccak256([]byte(req.EventID)))
@@ -163,6 +190,32 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 		EventID:  req.EventID,
 		Anchored: true,
 	})
+}
+
+// recoverDigestSigner recovers the address that signed the 32-byte digest (event_hash)
+// via EIP-191 personal_sign — the same contract as PHP EthSignature::recoverFromDigest:
+// keccak256("\x19Ethereum Signed Message:\n32" + digest), then secp256k1 recover.
+func recoverDigestSigner(eventHashHex, sigHex string) (string, error) {
+	digest := common.FromHex("0x" + strings.TrimPrefix(eventHashHex, "0x"))
+	if len(digest) != 32 {
+		return "", fmt.Errorf("event_hash must be 32 bytes")
+	}
+	prefixed := append([]byte("\x19Ethereum Signed Message:\n"+strconv.Itoa(len(digest))), digest...)
+	msgHash := crypto.Keccak256(prefixed)
+
+	sig := common.FromHex("0x" + strings.TrimPrefix(sigHex, "0x"))
+	if len(sig) != 65 {
+		return "", fmt.Errorf("signature must be 65 bytes")
+	}
+	if sig[64] >= 27 {
+		sig[64] -= 27
+	}
+
+	pub, err := crypto.SigToPub(msgHash, sig)
+	if err != nil {
+		return "", err
+	}
+	return crypto.PubkeyToAddress(*pub).Hex(), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

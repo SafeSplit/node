@@ -1,0 +1,14 @@
+# SafeSplit Go node — DEV image with live reload (Air).
+# Source is mounted as a volume; Air rebuilds + restarts on every .go change.
+FROM golang:1.25
+
+WORKDIR /app
+
+# Live-reload tool.
+RUN go install github.com/air-verse/air@latest
+ENV PATH="/go/bin:${PATH}"
+
+EXPOSE 8081
+
+# Resolve deps once, then hand off to Air (which rebuilds on change).
+CMD ["sh", "-c", "go mod tidy && air -c .air.toml"]

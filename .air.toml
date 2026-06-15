@@ -1,0 +1,15 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/safesplit-node ."
+  bin = "./tmp/safesplit-node"
+  include_ext = ["go", "mod"]
+  exclude_dir = ["tmp", "deployments"]
+  delay = 500
+  stop_on_error = true
+  # If file-change events don't propagate in your Docker setup, set poll = true.
+  poll = false
+
+[misc]
+  clean_on_exit = true

@@ -4,7 +4,7 @@ services:
   safesplit-node:
     build:
       context: .
-      dockerfile: ./Dockerfile
+      dockerfile: ./Dockerfile.dev
     image: safesplit-node
     container_name: safesplit-node
     restart: unless-stopped
@@ -16,4 +16,9 @@ services:
     ports:
       - 49170:8081
     volumes:
+      - .:/app                                          # live source for Air
+      - safesplit-node-gomod:/go/pkg/mod                # cache Go modules
       - ../blockchain/deployments:/app/deployments:ro
+
+volumes:
+  safesplit-node-gomod:
