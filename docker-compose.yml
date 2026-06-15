@@ -1,0 +1,19 @@
+name: safesplit-node
+
+services:
+  safesplit-node:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: safesplit-node
+    container_name: safesplit-node
+    restart: unless-stopped
+    environment:
+      NODE_RPC_URL: http://host.docker.internal:49545
+      NODE_DEPLOYMENT_PATH: /app/deployments/deployment.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - 49170:8081
+    volumes:
+      - ../blockchain/deployments:/app/deployments:ro
