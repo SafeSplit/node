@@ -43,11 +43,29 @@ type eventMsg struct {
 	PublicKey string `json:"public_key"`
 }
 
+// Block is one entry in the single global hash-chain.
+type Block struct {
+	Height    int    `json:"height"`
+	EventID   string `json:"event_id"`
+	EventHash string `json:"event_hash"`
+	Signature string `json:"signature"`
+	PublicKey string `json:"public_key"`
+	Timestamp string `json:"timestamp"`
+	PrevHash  string `json:"previous_block_hash"`
+	Nonce     int    `json:"nonce"`
+	BlockHash string `json:"block_hash"`
+}
+
 type peer struct {
 	Address  string `json:"address"`
 	Active   bool   `json:"active"`
 	LastSeen string `json:"last_seen"`
 }
+
+// PoW difficulty: block_hash must start with this prefix.
+const powPrefix = "0000"
+
+var genesisHash = strings.Repeat("0", 64)
 
 var (
 	nodeID string
@@ -61,6 +79,10 @@ var (
 
 	eventsMu sync.RWMutex
 	events   = map[string]eventMsg{}
+
+	chainMu   sync.RWMutex
+	chain     []Block
+	proposeMu sync.Mutex // serializes block production on this node
 
 	client       *ethclient.Client
 	contract     *bind.BoundContract
@@ -96,6 +118,8 @@ func main() {
 	mux.HandleFunc("/announce", handleAnnounce)
 	mux.HandleFunc("/events", handleEvents)
 	mux.HandleFunc("/gossip", handleGossip)
+	mux.HandleFunc("/blocks/propose", handlePropose)
+	mux.HandleFunc("/blocks/commit", handleCommit)
 
 	// Discover peers + start heartbeat in the background.
 	go discover(bootstrap)
@@ -342,6 +366,152 @@ func ping(addr string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+/* ---------- chain / Proof of Work / consensus ---------- */
+
+func sha256hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func tip() string {
+	chainMu.RLock()
+	defer chainMu.RUnlock()
+	if len(chain) == 0 {
+		return genesisHash
+	}
+	return chain[len(chain)-1].BlockHash
+}
+
+func chainHeight() int {
+	chainMu.RLock()
+	defer chainMu.RUnlock()
+	return len(chain)
+}
+
+func appendBlock(b Block) {
+	chainMu.Lock()
+	chain = append(chain, b)
+	chainMu.Unlock()
+	ingest(eventMsg{EventID: b.EventID, EventHash: b.EventHash, Signature: b.Signature, PublicKey: b.PublicKey})
+}
+
+func findBlockByEvent(eventID string) (Block, bool) {
+	chainMu.RLock()
+	defer chainMu.RUnlock()
+	for _, b := range chain {
+		if b.EventID == eventID {
+			return b, true
+		}
+	}
+	return Block{}, false
+}
+
+// mine searches for a nonce so that SHA256(eventHash+prev+nonce) starts with powPrefix.
+func mine(eventHash, prev string) (int, string) {
+	for nonce := 0; ; nonce++ {
+		h := sha256hex(eventHash + prev + strconv.Itoa(nonce))
+		if strings.HasPrefix(h, powPrefix) {
+			return nonce, h
+		}
+	}
+}
+
+func validBlockHash(b Block) bool {
+	h := sha256hex(b.EventHash + b.PrevHash + strconv.Itoa(b.Nonce))
+	return h == b.BlockHash && strings.HasPrefix(h, powPrefix)
+}
+
+// validateBlock runs the independent checks each node performs before voting/committing.
+func validateBlock(b Block) error {
+	if !validBlockHash(b) {
+		return fmt.Errorf("invalid proof of work")
+	}
+	if b.PrevHash != tip() {
+		return fmt.Errorf("previous_block_hash does not match local tip")
+	}
+	if b.Signature != "" && b.PublicKey != "" {
+		signer, err := recoverDigestSigner(b.EventHash, b.Signature)
+		if err != nil || !strings.EqualFold(signer, b.PublicKey) {
+			return fmt.Errorf("invalid signature")
+		}
+	}
+	return nil
+}
+
+// proposeBlock mines a block for the event, runs 2/3 consensus, commits, and anchors.
+func proposeBlock(ev eventMsg) (Block, string, error) {
+	proposeMu.Lock()
+	defer proposeMu.Unlock()
+
+	// Idempotent: if this event is already in the chain, just (re-)anchor it.
+	if b, ok := findBlockByEvent(ev.EventID); ok {
+		tx, err := anchorEvent(ev)
+		return b, tx, err
+	}
+
+	prev := tip()
+	nonce, blockHash := mine(ev.EventHash, prev)
+	b := Block{
+		Height:    chainHeight(),
+		EventID:   ev.EventID,
+		EventHash: ev.EventHash,
+		Signature: ev.Signature,
+		PublicKey: ev.PublicKey,
+		Timestamp: now(),
+		PrevHash:  prev,
+		Nonce:     nonce,
+		BlockHash: blockHash,
+	}
+
+	// Collect votes (self counts as yes).
+	yes, total := 1, len(peerAddrs())+1
+	for _, addr := range peerAddrs() {
+		if requestVote(addr, b) {
+			yes++
+		}
+	}
+	log.Printf("[%s] block %d for %s: %d/%d votes", nodeID, b.Height, ev.EventID, yes, total)
+
+	if yes*3 < total*2 { // need >= 2/3
+		return b, "", fmt.Errorf("consensus failed (%d/%d votes)", yes, total)
+	}
+
+	// Accepted: append locally, commit to peers, then the proposer anchors (D4).
+	appendBlock(b)
+	for _, addr := range peerAddrs() {
+		commitBlock(addr, b)
+	}
+	tx, err := anchorEvent(ev)
+	if err != nil {
+		return b, "", err
+	}
+	log.Printf("[%s] block %d committed + anchored (tx %s)", nodeID, b.Height, tx)
+	return b, tx, nil
+}
+
+func requestVote(addr string, b Block) bool {
+	body, _ := json.Marshal(b)
+	resp, err := httpClient.Post(addr+"/blocks/propose", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Vote bool `json:"vote"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return false
+	}
+	return out.Vote
+}
+
+func commitBlock(addr string, b Block) {
+	body, _ := json.Marshal(b)
+	if resp, err := httpClient.Post(addr+"/blocks/commit", "application/json", bytes.NewReader(body)); err == nil {
+		resp.Body.Close()
+	}
+}
+
 /* ---------- HTTP handlers ---------- */
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +535,8 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		"peers":        snapshotPeers(),
 		"events_count": count,
 		"event_ids":    ids,
+		"chain_height": chainHeight(),
+		"tip":          tip(),
 	})
 }
 
@@ -406,13 +578,20 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 		gossip(ev)
 	}
 
-	txHash, err := anchorEvent(ev)
+	// This node is the single proposer for the event: mine PoW, run 2/3 consensus,
+	// commit the block across the network, then anchor on Hardhat.
+	block, txHash, err := proposeBlock(ev)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	log.Printf("[%s] anchored %s → tx %s", nodeID, ev.EventID, txHash)
-	writeJSON(w, http.StatusOK, map[string]any{"tx_hash": txHash, "event_id": ev.EventID, "anchored": true})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tx_hash":    txHash,
+		"event_id":   ev.EventID,
+		"block_hash": block.BlockHash,
+		"height":     block.Height,
+		"anchored":   true,
+	})
 }
 
 // /gossip — from a peer: verify, ingest, re-gossip (no anchoring).
@@ -435,6 +614,38 @@ func handleGossip(w http.ResponseWriter, r *http.Request) {
 		gossip(ev) // flood onward; peers de-dup via seen-set
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// /blocks/propose — a peer asks us to validate + vote on a proposed block.
+func handlePropose(w http.ResponseWriter, r *http.Request) {
+	var b Block
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateBlock(b); err != nil {
+		log.Printf("[%s] vote NO on block %d (%s): %v", nodeID, b.Height, b.EventID, err)
+		writeJSON(w, http.StatusOK, map[string]any{"vote": false, "reason": err.Error()})
+		return
+	}
+	log.Printf("[%s] vote YES on block %d (%s)", nodeID, b.Height, b.EventID)
+	writeJSON(w, http.StatusOK, map[string]any{"vote": true})
+}
+
+// /blocks/commit — the proposer tells us an accepted block is final.
+func handleCommit(w http.ResponseWriter, r *http.Request) {
+	var b Block
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateBlock(b); err != nil {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	appendBlock(b)
+	log.Printf("[%s] committed block %d (%s)", nodeID, b.Height, b.EventID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "height": chainHeight()})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
