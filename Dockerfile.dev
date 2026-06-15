@@ -10,5 +10,6 @@ ENV PATH="/go/bin:${PATH}"
 
 EXPOSE 8081
 
-# Resolve deps once, then hand off to Air (which rebuilds on change).
-CMD ["sh", "-c", "go mod tidy && air -c .air.toml"]
+# Air rebuilds + restarts on change. (go.sum is committed; run `go mod tidy`
+# manually after adding new dependencies.)
+CMD ["air", "-c", ".air.toml"]

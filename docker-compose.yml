@@ -1,24 +1,61 @@
 name: safesplit-node
 
+x-node-common: &node-common
+  build:
+    context: .
+    dockerfile: ./Dockerfile.dev
+  image: safesplit-node
+  restart: unless-stopped
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - .:/app                              # live source for Air
+    - safesplit-node-gomod:/go/pkg/mod    # shared module cache
+    - ../blockchain/deployments:/app/deployments:ro
+
 services:
-  safesplit-node:
-    build:
-      context: .
-      dockerfile: ./Dockerfile.dev
-    image: safesplit-node
-    container_name: safesplit-node
-    restart: unless-stopped
+  safesplit-node1:
+    <<: *node-common
+    container_name: safesplit-node1
     environment:
+      NODE_ID: node1
+      NODE_SELF: http://safesplit-node1:8081
+      NODE_BOOTSTRAP: ""   # node1 IS the bootstrap
       NODE_RPC_URL: http://host.docker.internal:49545
       NODE_DEPLOYMENT_PATH: /app/deployments/deployment.json
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      NODE_PRIVATE_KEY: ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
     ports:
       - 49170:8081
-    volumes:
-      - .:/app                                          # live source for Air
-      - safesplit-node-gomod:/go/pkg/mod                # cache Go modules
-      - ../blockchain/deployments:/app/deployments:ro
+
+  safesplit-node2:
+    <<: *node-common
+    container_name: safesplit-node2
+    environment:
+      NODE_ID: node2
+      NODE_SELF: http://safesplit-node2:8081
+      NODE_BOOTSTRAP: http://safesplit-node1:8081
+      NODE_RPC_URL: http://host.docker.internal:49545
+      NODE_DEPLOYMENT_PATH: /app/deployments/deployment.json
+      NODE_PRIVATE_KEY: 59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+    ports:
+      - 49171:8081
+    depends_on:
+      - safesplit-node1
+
+  safesplit-node3:
+    <<: *node-common
+    container_name: safesplit-node3
+    environment:
+      NODE_ID: node3
+      NODE_SELF: http://safesplit-node3:8081
+      NODE_BOOTSTRAP: http://safesplit-node1:8081
+      NODE_RPC_URL: http://host.docker.internal:49545
+      NODE_DEPLOYMENT_PATH: /app/deployments/deployment.json
+      NODE_PRIVATE_KEY: 5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+    ports:
+      - 49172:8081
+    depends_on:
+      - safesplit-node1
 
 volumes:
   safesplit-node-gomod:

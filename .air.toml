@@ -1,14 +1,15 @@
 root = "."
-tmp_dir = "tmp"
+# Build OUTSIDE the shared source mount so multiple node containers don't clobber
+# each other's binaries (each container has its own /tmp).
+tmp_dir = "/tmp/air"
 
 [build]
-  cmd = "go build -o ./tmp/safesplit-node ."
-  bin = "./tmp/safesplit-node"
+  cmd = "go build -buildvcs=false -o /tmp/air/safesplit-node ."
+  bin = "/tmp/air/safesplit-node"
   include_ext = ["go", "mod"]
   exclude_dir = ["tmp", "deployments"]
   delay = 500
   stop_on_error = true
-  # If file-change events don't propagate in your Docker setup, set poll = true.
   poll = false
 
 [misc]
